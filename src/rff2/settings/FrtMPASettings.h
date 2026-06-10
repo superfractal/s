@@ -1,5 +1,6 @@
 //
 // Created by Merutilm on 2025-05-04.
+// Modified by Fable 5
 //
 
 #pragma once
@@ -16,5 +17,6 @@ namespace merutilm::rff2 {
         float epsilonPower;
         FrtMPASelectionMethod mpaSelectionMethod;
         FrtMPACompressionMethod mpaCompressionMethod;
+        bool useParallelTableGeneration;
     };
 }

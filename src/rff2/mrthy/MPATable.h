@@ -1,5 +1,6 @@
 //
 // Created by Merutilm on 2025-05-18.
+// Modified by Fable 5
 //
 
 #pragma once
@@ -7,6 +8,10 @@
 
 #include <algorithm>
 #include <any>
+#include <atomic>
+#include <mutex>
+#include <thread>
+#include <xmmintrin.h>
 
 #include "../constants/Constants.hpp"
 #include "../data/ApproxTableManager.h"
@@ -24,6 +29,9 @@ namespace merutilm::rff2 {
     template<Number Num>
     struct MPATable {
         static constexpr int REQUIRED_PERTURBATION = 2;
+
+        // below this longest period, the parallel creation overhead exceeds its gain
+        inline static uint64_t parallelMinLongestPeriod = std::is_same_v<Num, dex> ? 1ull << 16 : 1ull << 22;
 
         const FrtMPASettings mpaSettings;
 
@@ -68,6 +76,40 @@ namespace merutilm::rff2 {
 
         void generateTable(const ParallelRenderState &state, const MB2Reference<Num> &reference, Num dcMax,
                            std::function<void(uint64_t, double)> &&actionPerCreatingTableIteration);
+
+
+        struct ParallelTableJumpStart {
+            uint64_t iteration;
+            uint64_t toolIndex;
+        };
+
+        struct ParallelTableContext {
+            // counts the table pushes done per entry so the workers can keep the sequential push order
+            std::vector<std::atomic<uint16_t>> entryFill;
+            std::vector<ParallelTableJumpStart> jumpStarts;
+            std::mutex allocMutex;
+            std::atomic<bool> aborted{false};
+            std::mutex errorMutex;
+            std::exception_ptr error = nullptr;
+
+            explicit ParallelTableContext(const size_t entries) : entryFill(entries) {}
+        };
+
+        /**
+         * Inverse of @code iterationToPulledTableIndex()@endcode for valid pulled indices.
+         */
+        static uint64_t pulledTableIndexToIteration(const MPAPeriod &mpaPeriod, uint64_t index);
+
+        [[nodiscard]] bool generateTableParallel(const ParallelRenderState &state, const MB2Reference<Num> &reference,
+                                                 Num dcMax,
+                                                 const std::function<void(uint64_t, double)> &
+                                                 actionPerCreatingTableIteration,
+                                                 uint32_t workerCount);
+
+        void generateTableParallelWorker(const ParallelRenderState &state, const MB2Reference<Num> &reference,
+                                         double epsilon, Num dcMax, ParallelTableContext &ctx, uint32_t workerId,
+                                         uint32_t workerCount,
+                                         const std::function<void(uint64_t, double)> *actionPerCreatingTableIteration);
 
         void allocateWithCheckTableSize(uint64_t index, uint64_t levels);
 
@@ -357,6 +399,14 @@ namespace merutilm::rff2 {
 
         const auto func = std::move(actionPerCreatingTableIteration);
         const double epsilon = pow(10, epsilonPower);
+
+        if (const uint32_t workerCount = static_cast<uint32_t>(std::min<uint64_t>(
+                    levels, std::max(1u, std::thread::hardware_concurrency())));
+            mpaSettings.useParallelTableGeneration && longestPeriod >= parallelMinLongestPeriod &&
+            workerCount >= 2 && generateTableParallel(state, reference, dcMax, func, workerCount)) {
+            return;
+        }
+
         uint64_t iteration = 1;
         uint64_t absIteration = 0;
         auto periodCount = std::vector<uint64_t>(levels, 0);
@@ -379,6 +429,473 @@ namespace merutilm::rff2 {
 
             ++iteration;
             ++absIteration;
+        }
+    }
+
+    template<Number Num>
+    uint64_t MPATable<Num>::pulledTableIndexToIteration(const MPAPeriod &mpaPeriod, const uint64_t index) {
+        const auto &tablePeriod = mpaPeriod.tablePeriod;
+        const auto &tablePeriodElements = mpaPeriod.skippableIterationsCount;
+
+        uint64_t iteration = 1;
+        uint64_t remainder = index;
+
+        for (uint64_t i = tablePeriod.size(); i > 0; --i) {
+            iteration += remainder / tablePeriodElements[i - 1] * tablePeriod[i - 1];
+            remainder %= tablePeriodElements[i - 1];
+        }
+        return iteration;
+    }
+
+
+    template<Number Num>
+    bool MPATable<Num>::generateTableParallel(const ParallelRenderState &state, const MB2Reference<Num> &reference,
+                                              Num dcMax,
+                                              const std::function<void(uint64_t, double)> &
+                                              actionPerCreatingTableIteration, const uint32_t workerCount) {
+
+        const double epsilon = pow(10, mpaSettings.epsilonPower);
+        auto ctx = ParallelTableContext(tableManager->mpaTable->size());
+
+        ctx.jumpStarts.reserve(pulledMPACompressor.size());
+        for (uint64_t toolIndex = 0; toolIndex < pulledMPACompressor.size(); ++toolIndex) {
+            const uint64_t startIndex = pulledMPACompressor[toolIndex].start - 1;
+            const uint64_t startIteration = pulledTableIndexToIteration(*mpaPeriod, startIndex);
+            if (iterationToPulledTableIndex(*mpaPeriod, startIteration) != startIndex ||
+                !ArrayCompressor::isIndependent(pulledMPACompressor, startIndex)) {
+                // the jump entry shares a compressed entry with another start.
+                // the parallel push ordering cannot be predetermined, use the sequential creation
+                return false;
+            }
+            ctx.jumpStarts.emplace_back(startIteration, toolIndex);
+        }
+        std::ranges::sort(ctx.jumpStarts, {}, &ParallelTableJumpStart::iteration);
+
+        {
+            auto workers = std::vector<std::jthread>();
+            workers.reserve(workerCount - 1);
+            for (uint32_t workerId = 1; workerId < workerCount; ++workerId) {
+                workers.emplace_back([this, &state, &reference, epsilon, dcMax, &ctx, workerId, workerCount] {
+                    generateTableParallelWorker(state, reference, epsilon, dcMax, ctx, workerId, workerCount, nullptr);
+                });
+            }
+            generateTableParallelWorker(state, reference, epsilon, dcMax, ctx, 0, workerCount,
+                                        &actionPerCreatingTableIteration);
+        }
+
+        if (ctx.error != nullptr) {
+            std::rethrow_exception(ctx.error);
+        }
+        return true;
+    }
+
+
+    template<Number Num>
+    void MPATable<Num>::generateTableParallelWorker(const ParallelRenderState &state,
+                                                    const MB2Reference<Num> &reference, const double epsilon,
+                                                    Num dcMax, ParallelTableContext &ctx, const uint32_t workerId,
+                                                    const uint32_t workerCount,
+                                                    const std::function<void(uint64_t, double)> *
+                                                    actionPerCreatingTableIteration) {
+        // Replicates the sequential generateTable() loop. Every worker executes the identical
+        // integer control flow (period counters, jump decisions, generator lifetimes as "shadows"),
+        // and materializes the floating-point PAGenerator work only for its owned levels
+        // (level % workerCount == workerId). Therefore each generator receives exactly the same
+        // step()/merge() sequence as the sequential creation, and the result is bit-identical.
+        // The per-entry atomic counter "entryFill" enforces the sequential push order of each entry.
+        try {
+            auto &table = *tableManager->mpaTable;
+            const auto &tablePeriod = mpaPeriod->tablePeriod;
+            const auto &skippableIterationsCount = mpaPeriod->skippableIterationsCount;
+            const uint64_t levels = tablePeriod.size();
+            const uint64_t longestPeriod = tablePeriod.back();
+            const FrtMPACompressionMethod method = mpaSettings.mpaCompressionMethod;
+
+            auto periodCount = std::vector<uint64_t>(levels, 0);
+            auto currentPA = std::vector<std::optional<PAGenerator<Num>>>(levels);
+
+            // integer shadows of every level's generator
+            auto genActive = std::vector<uint8_t>(levels, 0);
+            auto genStart = std::vector<uint64_t>(levels, 0);
+            auto genSkip = std::vector<uint64_t>(levels, 0);
+            auto genEntry = std::vector<uint64_t>(levels, UINT64_MAX);
+            auto genOrdinal = std::vector<uint16_t>(levels, 0);
+            auto genTurnPending = std::vector<uint8_t>(levels, 0);
+            auto mainSkip = std::vector<uint64_t>(levels, 0);
+
+            const auto owned = [workerId, workerCount](const uint64_t level) {
+                return level % workerCount == workerId;
+            };
+            const auto interrupted = [&ctx, &state] {
+                return ctx.aborted.load(std::memory_order_relaxed) || state.interruptRequested();
+            };
+            // waits until the given entry reaches the given push turn. returns false on interruption.
+            const auto waitTurn = [&ctx, &interrupted](const uint64_t entry, const uint16_t turn) {
+                const std::atomic<uint16_t> &fill = ctx.entryFill[entry];
+                uint32_t spin = 0;
+                while (fill.load(std::memory_order_acquire) < turn) {
+                    if ((++spin & 0xfff) == 0 && interrupted()) {
+                        return false;
+                    }
+                    _mm_pause();
+                }
+                return !ctx.aborted.load(std::memory_order_relaxed);
+            };
+            const auto finishTurn = [&ctx](const uint64_t entry, const uint16_t turn) {
+                ctx.entryFill[entry].store(turn + 1, std::memory_order_release);
+            };
+            // waits until the main reference PA of the given level is readable
+            const auto waitMainPA = [&ctx, &interrupted](const uint64_t level) {
+                const std::atomic<uint16_t> &fill = ctx.entryFill[0];
+                uint32_t spin = 0;
+                while (fill.load(std::memory_order_acquire) <= level) {
+                    if ((++spin & 0xfff) == 0 && interrupted()) {
+                        return false;
+                    }
+                    _mm_pause();
+                }
+                return !ctx.aborted.load(std::memory_order_relaxed);
+            };
+            // the strict table resource is not thread-safe, so every allocation is locked
+            const auto reserveForPush = [&ctx, levels](std::pmr::vector<PA<Num>> &pa) {
+                if (pa.size() == pa.capacity()) {
+                    std::scoped_lock lock(ctx.allocMutex);
+                    pa.reserve(pa.capacity() + levels);
+                }
+            };
+            const auto pushPA = [&ctx](std::pmr::vector<PA<Num>> &pa, auto &&makePA) {
+                if constexpr (PABase<Num>::MAX_DEGREE > 1) {
+                    // the PA of higher degrees allocates its term vector from the strict table resource
+                    std::scoped_lock lock(ctx.allocMutex);
+                    pa.push_back(makePA());
+                } else {
+                    pa.push_back(makePA());
+                }
+            };
+            const auto buildLocked = [this, &ctx](PAGenerator<Num> &generator) {
+                if constexpr (PABase<Num>::MAX_DEGREE > 1) {
+                    std::scoped_lock lock(ctx.allocMutex);
+                    return generator.build(tableManager->strictTableResource.get());
+                } else {
+                    return generator.build(tableManager->strictTableResource.get());
+                }
+            };
+
+            // Multiple turns of one iteration must be consumed in ordinal order, but the level loop
+            // visits the levels downwards. They are deferred and flushed in a globally consistent
+            // (entry, ordinal) order at the end of each iteration to avoid the deadlock.
+            enum class TurnKind : uint8_t { EMPTY, COPY_MAIN, STORE };
+            struct DeferredTurn {
+                uint64_t entry;
+                uint16_t ordinal;
+                TurnKind kind;
+                uint64_t level;
+                uint64_t skip;
+                std::optional<PA<Num>> built;
+            };
+            auto deferredTurns = std::vector<DeferredTurn>();
+
+            const auto flushTurns = [&]() -> bool {
+                std::ranges::sort(deferredTurns, [](const DeferredTurn &a, const DeferredTurn &b) {
+                    return a.entry != b.entry ? a.entry < b.entry : a.ordinal < b.ordinal;
+                });
+                for (DeferredTurn &turn: deferredTurns) {
+                    if (!waitTurn(turn.entry, turn.ordinal)) {
+                        return false;
+                    }
+                    switch (turn.kind) {
+                        case TurnKind::EMPTY:
+                            break;
+                        case TurnKind::COPY_MAIN: {
+                            if (!waitMainPA(turn.level)) {
+                                return false;
+                            }
+                            auto &pa = table[turn.entry];
+                            reserveForPush(pa);
+                            pushPA(pa, [&table, &turn]() -> const PA<Num> & { return table[0][turn.level]; });
+                            break;
+                        }
+                        case TurnKind::STORE: {
+                            auto &pa = table[turn.entry];
+                            reserveForPush(pa);
+                            if (pa.empty() || pa.back().skip < turn.skip) {
+                                pushPA(pa, [&turn] { return std::move(*turn.built); });
+                            } else {
+                                vkh::logger::w_log(L"WARNING : The insertion of pa generated from compressed "
+                                                   L"index {} is not allowed. It might be a bug!",
+                                                   turn.entry);
+                            }
+                            break;
+                        }
+                    }
+                    finishTurn(turn.entry, turn.ordinal);
+                }
+                deferredTurns.clear();
+                return true;
+            };
+
+            uint64_t iteration = 1;
+            uint64_t absIteration = 0;
+            size_t jumpCursor = 0;
+
+            while (iteration <= longestPeriod) {
+                if (absIteration % Constants::Fractal::EXIT_CHECK_INTERVAL == 0 && interrupted()) {
+                    return;
+                }
+                if (actionPerCreatingTableIteration != nullptr) {
+                    (*actionPerCreatingTableIteration)(iteration,
+                                                       static_cast<double>(iteration) / static_cast<double>(
+                                                           longestPeriod));
+                }
+
+                // valid pulled indices only exist where the lowest-level period counter is zero
+                const uint64_t pulledTableIndex = periodCount[0] == 0
+                                                      ? iterationToPulledTableIndex(*mpaPeriod, iteration)
+                                                      : UINT64_MAX;
+                bool jumped = false;
+
+                while (jumpCursor < ctx.jumpStarts.size() && ctx.jumpStarts[jumpCursor].iteration < iteration) {
+                    ++jumpCursor;
+                }
+
+                // tryJumpTableGeneration() replication
+                if (jumpCursor < ctx.jumpStarts.size() && ctx.jumpStarts[jumpCursor].iteration == iteration) {
+                    const ArrayCompressionTool &tool = pulledMPACompressor[ctx.jumpStarts[jumpCursor].toolIndex];
+                    ++jumpCursor;
+
+                    const uint64_t level = binarySearch(skippableIterationsCount, tool.end - tool.start + 2);
+                    const uint64_t compTableIndex = iterationToCompTableIndex(method, *mpaPeriod, pulledMPACompressor,
+                                                                              iteration);
+                    if (level == UINT64_MAX || compTableIndex >= table.size()) {
+                        throw vkh::exception_init("index out of range");
+                    }
+
+                    const uint64_t skip = mainSkip[level];
+                    bool accepted = true;
+                    for (uint64_t i = level + 1; i < levels; ++i) {
+                        if (periodCount[i] + skip > tablePeriod[i] - REQUIRED_PERTURBATION) {
+                            if (workerId == 0) {
+                                vkh::logger::w_log(L"WARNING : Failed to compress!! \n what : the table period count "
+                                                   L"{} + skip {} exceeds its period {}.",
+                                                   periodCount[i], skip, tablePeriod[i]);
+                            }
+                            accepted = false;
+                            break;
+                        }
+                    }
+
+                    if (accepted) {
+                        uint16_t createdOrdinal = static_cast<uint16_t>(level + 1);
+
+                        for (uint64_t i = 0; i < levels; ++i) {
+                            if (i <= level) {
+                                if (genActive[i] && genTurnPending[i]) {
+                                    // generator killed by the jump : consume its pending turn without push
+                                    if (owned(i)) {
+                                        deferredTurns.push_back({genEntry[i], genOrdinal[i], TurnKind::EMPTY, 0, 0,
+                                                                 std::nullopt});
+                                    }
+                                    genTurnPending[i] = 0;
+                                }
+                                genActive[i] = 0;
+
+                                uint64_t count = skip;
+                                for (uint64_t j = level; j > i; --j) {
+                                    count %= tablePeriod[j - 1];
+                                }
+                                periodCount[i] = count;
+
+                                if (owned(i)) {
+                                    currentPA[i] = std::nullopt;
+                                    deferredTurns.push_back({compTableIndex, static_cast<uint16_t>(i),
+                                                             TurnKind::COPY_MAIN, i, 0, std::nullopt});
+                                }
+                            } else {
+                                const bool wasActive = genActive[i] != 0;
+                                if (!wasActive) {
+                                    genActive[i] = 1;
+                                    genStart[i] = iteration;
+                                    genSkip[i] = 0;
+                                    genEntry[i] = compTableIndex;
+                                    // only block-aligned creations can ever be stored, so only they take a turn
+                                    if (periodCount[i] == 0) {
+                                        genOrdinal[i] = createdOrdinal++;
+                                        genTurnPending[i] = 1;
+                                    } else {
+                                        genTurnPending[i] = 0;
+                                    }
+                                }
+                                if (owned(i)) {
+                                    if (!waitMainPA(level)) {
+                                        return;
+                                    }
+                                    const PA<Num> &mainReferencePA = table[0][level];
+                                    if (!wasActive) {
+                                        currentPA[i].emplace(reference, epsilon, dcMax, iteration);
+                                    }
+                                    currentPA[i]->merge(mainReferencePA);
+                                }
+                                genSkip[i] += skip;
+                                periodCount[i] += skip;
+                            }
+                        }
+
+                        iteration += skip;
+                        jumped = true;
+                    }
+                }
+
+                // stepOnce() replication
+                bool resetLowerLevel = false;
+                const bool independent = ArrayCompressor::isIndependent(pulledMPACompressor, pulledTableIndex);
+
+                for (uint64_t i = levels; i > 0; --i) {
+                    const uint64_t level = i - 1;
+
+                    if (periodCount[level] == 0 && independent && !jumped) {
+                        if (genActive[level] && genTurnPending[level]) {
+                            // replaced generator : consume its pending turn without push
+                            if (owned(level)) {
+                                deferredTurns.push_back({genEntry[level], genOrdinal[level], TurnKind::EMPTY, 0, 0,
+                                                         std::nullopt});
+                            }
+                            genTurnPending[level] = 0;
+                        }
+                        const uint64_t compTableIndex = method == FrtMPACompressionMethod::NO_COMPRESSION
+                                                            ? iteration
+                                                            : pulledTableIndex == UINT64_MAX
+                                                                  ? UINT64_MAX
+                                                                  : method == FrtMPACompressionMethod::LITTLE_COMPRESSION
+                                                                        ? pulledTableIndex
+                                                                        : ArrayCompressor::compress(
+                                                                            pulledMPACompressor, pulledTableIndex);
+                        genActive[level] = 1;
+                        genStart[level] = iteration;
+                        genSkip[level] = 0;
+                        genEntry[level] = compTableIndex;
+                        genOrdinal[level] = static_cast<uint16_t>(level);
+                        genTurnPending[level] = compTableIndex != UINT64_MAX && compTableIndex < table.size() ? 1 : 0;
+                        if (owned(level)) {
+                            currentPA[level].emplace(reference, epsilon, dcMax, iteration);
+                        }
+                    }
+
+                    if (genActive[level] && periodCount[level] + REQUIRED_PERTURBATION < tablePeriod[level]) {
+                        if (owned(level)) {
+                            currentPA[level]->step();
+                        }
+                        ++genSkip[level];
+                    }
+
+                    ++periodCount[level];
+
+                    if (periodCount[level] == tablePeriod[level]) {
+                        if (genActive[level] && genSkip[level] == tablePeriod[level] - REQUIRED_PERTURBATION) {
+                            const uint64_t compTableIndex = genEntry[level];
+
+                            if (compTableIndex == UINT64_MAX) {
+                                if (workerId == 0) {
+                                    vkh::logger::w_log(L"FATAL : FAILED TO CREATING TABLE!!\n what : iteration {} is "
+                                                       L"not pullable. aborting the table creation...",
+                                                       genStart[level]);
+                                }
+                                // the sequential creation skips the lower levels of this iteration
+                                break;
+                            }
+                            if (compTableIndex >= table.size()) {
+                                throw vkh::exception_init("index out of range");
+                            }
+                            if (genStart[level] == 1) {
+                                mainSkip[level] = genSkip[level];
+                            }
+                            if (owned(level)) {
+                                deferredTurns.push_back({compTableIndex, genOrdinal[level], TurnKind::STORE, level,
+                                                         genSkip[level], buildLocked(*currentPA[level])});
+                            }
+                            genTurnPending[level] = 0;
+                        } else if (genActive[level] && genTurnPending[level]) {
+                            // completed without a storable skip : consume the turn without push
+                            if (owned(level)) {
+                                deferredTurns.push_back({genEntry[level], genOrdinal[level], TurnKind::EMPTY, 0, 0,
+                                                         std::nullopt});
+                            }
+                            genTurnPending[level] = 0;
+                        }
+                        genActive[level] = 0;
+                        if (owned(level)) {
+                            currentPA[level] = std::nullopt;
+                        }
+                        resetLowerLevel = true;
+                    }
+
+                    if (resetLowerLevel) {
+                        if (periodCount[level] != tablePeriod[level] && genActive[level] && genTurnPending[level]) {
+                            // cut by an upper-level completion : the generator lingers but is never stored
+                            if (owned(level)) {
+                                deferredTurns.push_back({genEntry[level], genOrdinal[level], TurnKind::EMPTY, 0, 0,
+                                                         std::nullopt});
+                            }
+                            genTurnPending[level] = 0;
+                        }
+                        periodCount[level] = 0;
+                    }
+                }
+
+                if (!deferredTurns.empty() && !flushTurns()) {
+                    return;
+                }
+
+                ++iteration;
+                ++absIteration;
+
+                // Fast-forwards the plain iterations in bulk : while no level reaches a block
+                // boundary and no jump fires, the level loop above only steps the generators and
+                // increments the counters, so the duplicated per-level control flow is skipped.
+                // The generators receive the identical step() sequence.
+                uint64_t gap = iteration <= longestPeriod ? longestPeriod - iteration + 1 : 0;
+                if (jumpCursor < ctx.jumpStarts.size()) {
+                    const uint64_t nextJump = ctx.jumpStarts[jumpCursor].iteration;
+                    gap = std::min(gap, nextJump > iteration ? nextJump - iteration : 0);
+                }
+                for (uint64_t level = 0; level < levels && gap > 0; ++level) {
+                    const uint64_t bound = tablePeriod[level] - REQUIRED_PERTURBATION;
+                    gap = periodCount[level] == 0 || periodCount[level] >= bound
+                              ? 0
+                              : std::min(gap, bound - periodCount[level]);
+                }
+                if (gap > 0) {
+                    if (interrupted()) {
+                        return;
+                    }
+                    for (uint64_t level = 0; level < levels; ++level) {
+                        if (genActive[level]) {
+                            if (owned(level)) {
+                                PAGenerator<Num> &generator = *currentPA[level];
+                                for (uint64_t k = 0; k < gap; ++k) {
+                                    generator.step();
+                                }
+                            }
+                            genSkip[level] += gap;
+                        }
+                        periodCount[level] += gap;
+                    }
+                    if (actionPerCreatingTableIteration != nullptr) {
+                        for (uint64_t k = 0; k < gap; ++k) {
+                            (*actionPerCreatingTableIteration)(iteration + k,
+                                                               static_cast<double>(iteration + k) /
+                                                                       static_cast<double>(longestPeriod));
+                        }
+                    }
+                    iteration += gap;
+                    absIteration += gap;
+                }
+            }
+        } catch (...) {
+            ctx.aborted.store(true, std::memory_order_relaxed);
+            std::scoped_lock lock(ctx.errorMutex);
+            if (ctx.error == nullptr) {
+                ctx.error = std::current_exception();
+            }
         }
     }
 

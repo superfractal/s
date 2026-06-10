@@ -1,5 +1,6 @@
 //
 // Created by Merutilm on 2025-05-14.
+// Modified by Fable 5
 //
 
 #include "CallbackFractal.hpp"
@@ -162,7 +163,7 @@ namespace merutilm::rff2 {
     std::function<void()> CallbackFractal::fnMpa(AppRenderManager &arm) {
         return [&arm] {
             auto &[minSkipReference, maxMultiplierBetweenLevel, epsilonPower, mpaSelectionMethod,
-                   mpaCompressionMethod] = arm.getSettings().fractal.mpa;
+                   mpaCompressionMethod, useParallelTableGeneration] = arm.getSettings().fractal.mpa;
             auto window = std::make_unique<SettingsWindow>(L"MP-Approximation");
             window->registerTextInput<uint16_t>(
                     L"Min Skip Reference", &minSkipReference, Unparser::UINT16, Parser::UINT16,
@@ -196,6 +197,11 @@ namespace merutilm::rff2 {
                     L"as \"Little Compression\".\n L"
                     L"It uses acceleration when possible, and can accelerate table creation by 10x~100x of times.");
 
+            window->registerCheckboxInput(L"Parallel table generation", &useParallelTableGeneration,
+                                          Callback::NOTHING, L"Use parallel table generation",
+                                          L"Sets whether the MPA table creation should be parallel.\n"
+                                          L"Each skipping level is computed by its own thread,\n"
+                                          L"so the result is identical to the sequential creation.");
 
             window->setWindowCloseFunction([&arm] { arm.setCurrentSettingsWindows(nullptr); });
             arm.setCurrentSettingsWindows(std::move(window));
