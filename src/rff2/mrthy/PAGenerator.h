@@ -1,5 +1,6 @@
 //
 // Created by Merutilm on 2025-05-22.
+// Modified by Fable 5
 //
 
 #pragma once
@@ -186,6 +187,8 @@ namespace merutilm::rff2 {
 
         void merge(const PA<Num, 1> &pa);
 
+        void mergeConservative(const PA<Num, 1> &pa);
+
         void step();
 
         [[nodiscard]] PA<Num, 1> build([[maybe_unused]] std::pmr::monotonic_buffer_resource *const resource) { return PA<Num, 1>{this->skip, an, bn, this->radius}; }
@@ -201,6 +204,25 @@ namespace merutilm::rff2 {
         const complex<Num> bnMerge = target.an * bn + target.bn;
 
         this->radius = calculatable::try_normalized_value(std::min(this->radius, target.radius));
+
+        an = anMerge.try_normalized_value();
+        bn = bnMerge.try_normalized_value();
+
+        this->skip += target.skip;
+    }
+
+    template<Number Num>
+    void PAGenerator<Num, 1>::mergeConservative(const PA<Num, 1> &pa) {
+        // Same composition as merge(), but the target radius is folded through the current an/bn :
+        // |dz_target| = |an*dz + bn*dc| <= |an|*|dz| + |bn|*dcMax < target.radius
+        // <=> |dz| < (target.radius - |bn|*dcMax) / |an|
+        // so the combined radius never exceeds the per-step sequential validity bound.
+        const auto &target = pa;
+        const Num localRadius = (target.radius - bn.norm_approx() * this->dcMax) / an.norm_approx();
+        const complex<Num> anMerge = target.an * an;
+        const complex<Num> bnMerge = target.an * bn + target.bn;
+
+        this->radius = calculatable::try_normalized_value(std::min(this->radius, localRadius));
 
         an = anMerge.try_normalized_value();
         bn = bnMerge.try_normalized_value();

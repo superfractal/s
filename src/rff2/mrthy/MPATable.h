@@ -459,11 +459,11 @@ namespace merutilm::rff2 {
     // composed from its sub-block PAs with merge() plus the REQUIRED_PERTURBATION raw steps between
     // the blocks, so the total step() count is about the longest period instead of
     // levels * longest period. The block layout replicates the greedy decomposition of stepOnce()
-    // (each level tiles from the enclosing block start, the remainders cascade downwards), and the
-    // composition formula is the same merge() the reference-compression jump already uses, so the
-    // stored skips and entries are identical to the sequential creation. The an/bn/radius values are
-    // composed segment-wise instead of per-iteration, which is not bit-identical to the sequential
-    // results but matches the established merge() semantics.
+    // (each level tiles from the enclosing block start, the remainders cascade downwards), so the
+    // stored skips and entries are identical to the sequential creation. The an/bn values are
+    // composed segment-wise instead of per-iteration, which differs from the sequential results only
+    // by the floating-point reassociation. The radius is folded through mergeConservative(), so it
+    // never exceeds the per-step sequential validity bound and no epsilon adjustment is required.
     template<Number Num>
     bool MPATable<Num>::generateTableMerged(const ParallelRenderState &state, const MB2Reference<Num> &reference,
                                             Num dcMax,
@@ -530,7 +530,7 @@ namespace merutilm::rff2 {
                 if (subPA == std::nullopt) {
                     return std::nullopt;
                 }
-                composite.merge(*subPA);
+                composite.mergeConservative(*subPA);
                 offset += subPeriod;
             }
         }

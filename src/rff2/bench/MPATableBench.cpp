@@ -233,8 +233,11 @@ namespace merutilm::rff2::bench {
                     const auto below1 = static_cast<double>(std::ranges::lower_bound(cmp.radiusRatios, 1.0) -
                                                             cmp.radiusRatios.begin()) /
                                         static_cast<double>(cmp.radiusRatios.size());
-                    std::printf("    radius     within +-10%% : %.2f%% | ratio<1 (conservative) : %.2f%%\n",
-                                within10 * 100, below1 * 100);
+                    const auto optimistic = static_cast<uint64_t>(
+                            cmp.radiusRatios.end() - std::ranges::upper_bound(cmp.radiusRatios, 1.001));
+                    std::printf("    radius     within +-10%% : %.2f%% | ratio<1 (conservative) : %.2f%% | "
+                                "optimistic (>1.001) : %" PRIu64 "\n",
+                                within10 * 100, below1 * 100, optimistic);
                 } else {
                     std::printf("    structure : FAILED\n");
                     ++failures;
@@ -243,6 +246,20 @@ namespace merutilm::rff2::bench {
                     std::printf("    an/bn     : FAILED (relative error above 1e-9)\n");
                     ++failures;
                 }
+            }
+
+            if (method == FrtMPACompressionMethod::NO_COMPRESSION) {
+                // the alternative mitigation : lowering the precision level shrinks every radius
+                auto epsSettings = settings;
+                epsSettings.epsilonPower -= 1.0f;
+                double epsSeconds = 0;
+                const auto lowered = buildTable(state, *reference, epsSettings, dcMax, &epsSeconds);
+
+                CompareResult cmp = compareTables(*sequential, *lowered);
+                std::ranges::sort(cmp.radiusRatios);
+                std::printf("  (reference) epsilonPower-1 sequential : radius ratio p10 %.4f | p50 %.4f | p90 %.4f\n",
+                            percentile(cmp.radiusRatios, 0.10), percentile(cmp.radiusRatios, 0.50),
+                            percentile(cmp.radiusRatios, 0.90));
             }
 
             {

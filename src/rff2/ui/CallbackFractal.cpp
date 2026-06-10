@@ -209,8 +209,9 @@ namespace merutilm::rff2 {
                                           L"Composes every upper-level PA from its sub-level PAs instead of\n"
                                           L"stepping the orbit on all levels, so the table creation cost is about\n"
                                           L"the longest period instead of levels x longest period.\n"
-                                          L"It uses the same composition as the reference-compression jump,\n"
-                                          L"and takes priority over the parallel creation when applicable.");
+                                          L"The combined validity radius is folded conservatively, so it never\n"
+                                          L"exceeds the sequential bound and the precision level needs no change.\n"
+                                          L"It takes priority over the parallel creation when applicable.");
 
             window->setWindowCloseFunction([&arm] { arm.setCurrentSettingsWindows(nullptr); });
             arm.setCurrentSettingsWindows(std::move(window));
