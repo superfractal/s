@@ -78,6 +78,25 @@ namespace merutilm::rff2 {
                            std::function<void(uint64_t, double)> &&actionPerCreatingTableIteration);
 
 
+        struct MergedBuildState {
+            const ParallelRenderState &state;
+            const MB2Reference<Num> &reference;
+            const double epsilon;
+            const Num dcMax;
+            const std::function<void(uint64_t, double)> &actionPerCreatingTableIteration;
+            uint64_t blockCounter = 0;
+        };
+
+        [[nodiscard]] bool generateTableMerged(const ParallelRenderState &state, const MB2Reference<Num> &reference,
+                                               Num dcMax,
+                                               const std::function<void(uint64_t, double)> &
+                                               actionPerCreatingTableIteration);
+
+        [[nodiscard]] std::optional<PA<Num>> buildBlockMerged(MergedBuildState &ctx, uint64_t level, uint64_t start);
+
+        [[nodiscard]] std::optional<PA<Num>> storeMergedPA(PAGenerator<Num> &generator);
+
+
         struct ParallelTableJumpStart {
             uint64_t iteration;
             uint64_t toolIndex;
@@ -400,6 +419,10 @@ namespace merutilm::rff2 {
         const auto func = std::move(actionPerCreatingTableIteration);
         const double epsilon = pow(10, epsilonPower);
 
+        if (mpaSettings.useMergedTableGeneration && generateTableMerged(state, reference, dcMax, func)) {
+            return;
+        }
+
         if (const uint32_t workerCount = static_cast<uint32_t>(std::min<uint64_t>(
                     levels, std::max(1u, std::thread::hardware_concurrency())));
             mpaSettings.useParallelTableGeneration && longestPeriod >= parallelMinLongestPeriod &&
@@ -431,6 +454,122 @@ namespace merutilm::rff2 {
             ++absIteration;
         }
     }
+
+    // Merge-based table creation. Only the level-0 blocks step the orbit; every upper-level PA is
+    // composed from its sub-block PAs with merge() plus the REQUIRED_PERTURBATION raw steps between
+    // the blocks, so the total step() count is about the longest period instead of
+    // levels * longest period. The block layout replicates the greedy decomposition of stepOnce()
+    // (each level tiles from the enclosing block start, the remainders cascade downwards), and the
+    // composition formula is the same merge() the reference-compression jump already uses, so the
+    // stored skips and entries are identical to the sequential creation. The an/bn/radius values are
+    // composed segment-wise instead of per-iteration, which is not bit-identical to the sequential
+    // results but matches the established merge() semantics.
+    template<Number Num>
+    bool MPATable<Num>::generateTableMerged(const ParallelRenderState &state, const MB2Reference<Num> &reference,
+                                            Num dcMax,
+                                            const std::function<void(uint64_t, double)> &
+                                            actionPerCreatingTableIteration) {
+        if constexpr (PABase<Num>::MAX_DEGREE != 1) {
+            // merge() of the higher degrees is not supported
+            return false;
+        } else {
+            if (!pulledMPACompressor.empty()) {
+                // the jump restructuring of tryJumpTableGeneration() cannot be replayed by the block
+                // recursion, use the sequential/parallel creation
+                return false;
+            }
+            const double epsilon = pow(10, mpaSettings.epsilonPower);
+            MergedBuildState ctx{state, reference, epsilon, dcMax, actionPerCreatingTableIteration};
+            static_cast<void>(buildBlockMerged(ctx, mpaPeriod->tablePeriod.size() - 1, 1));
+            return true;
+        }
+    }
+
+
+    template<Number Num>
+    std::optional<PA<Num>> MPATable<Num>::buildBlockMerged(MergedBuildState &ctx, const uint64_t level,
+                                                           const uint64_t start) {
+        const auto &tablePeriod = mpaPeriod->tablePeriod;
+        const uint64_t longestPeriod = tablePeriod.back();
+
+        if (level == 0) {
+            // every level-0 block spans tablePeriod[0] >= 4 iterations, the mask keeps the
+            // interrupt-check cadence near EXIT_CHECK_INTERVAL
+            if ((ctx.blockCounter++ & 0x3f) == 0 && ctx.state.interruptRequested()) {
+                return std::nullopt;
+            }
+            ctx.actionPerCreatingTableIteration(start,
+                                                static_cast<double>(start) / static_cast<double>(longestPeriod));
+
+            auto generator = PAGenerator<Num>(ctx.reference, ctx.epsilon, ctx.dcMax, start);
+            const uint64_t steps = tablePeriod[0] - REQUIRED_PERTURBATION;
+            for (uint64_t k = 0; k < steps; ++k) {
+                generator.step();
+            }
+            return storeMergedPA(generator);
+        }
+
+        auto composite = PAGenerator<Num>(ctx.reference, ctx.epsilon, ctx.dcMax, start);
+        uint64_t remainder = tablePeriod[level];
+        uint64_t offset = 0;
+
+        for (uint64_t i = level; i > 0; --i) {
+            const uint64_t subPeriod = tablePeriod[i - 1];
+            const uint64_t groups = remainder / subPeriod;
+            remainder %= subPeriod;
+
+            for (uint64_t g = 0; g < groups; ++g) {
+                if (offset != 0) {
+                    // a sub-block PA skips its period minus REQUIRED_PERTURBATION iterations,
+                    // the gap before the next block start is stepped raw
+                    for (int k = 0; k < REQUIRED_PERTURBATION; ++k) {
+                        composite.step();
+                    }
+                }
+                const std::optional<PA<Num>> subPA = buildBlockMerged(ctx, i - 1, start + offset);
+                if (subPA == std::nullopt) {
+                    return std::nullopt;
+                }
+                composite.merge(*subPA);
+                offset += subPeriod;
+            }
+        }
+
+        // the unstructured tail whose length is below the shortest period
+        const uint64_t targetSkip = tablePeriod[level] - REQUIRED_PERTURBATION;
+        while (composite.skip < targetSkip) {
+            composite.step();
+        }
+        return storeMergedPA(composite);
+    }
+
+
+    template<Number Num>
+    std::optional<PA<Num>> MPATable<Num>::storeMergedPA(PAGenerator<Num> &generator) {
+        const uint64_t levels = mpaPeriod->tablePeriod.size();
+        const uint64_t compTableIndex = iterationToCompTableIndex(mpaSettings.mpaCompressionMethod, *mpaPeriod,
+                                                                  pulledMPACompressor, generator.start);
+        if (compTableIndex == UINT64_MAX) {
+            vkh::logger::w_log(L"FATAL : FAILED TO CREATING TABLE!!\n what : iteration {} is not "
+                               L"pullable. aborting the table creation...",
+                               generator.start);
+            return std::nullopt;
+        }
+
+        allocateWithCheckTableSize(compTableIndex, levels);
+        auto &pa = (*tableManager->mpaTable)[compTableIndex];
+        PA<Num> built = generator.build(tableManager->strictTableResource.get());
+
+        if (pa.empty() || pa.back().skip < built.skip) {
+            pa.push_back(built);
+        } else {
+            vkh::logger::w_log(L"WARNING : The insertion of pa generated from compressed index {} is not "
+                               L"allowed. It might be a bug!",
+                               compTableIndex);
+        }
+        return built;
+    }
+
 
     template<Number Num>
     uint64_t MPATable<Num>::pulledTableIndexToIteration(const MPAPeriod &mpaPeriod, const uint64_t index) {

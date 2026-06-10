@@ -163,7 +163,8 @@ namespace merutilm::rff2 {
     std::function<void()> CallbackFractal::fnMpa(AppRenderManager &arm) {
         return [&arm] {
             auto &[minSkipReference, maxMultiplierBetweenLevel, epsilonPower, mpaSelectionMethod,
-                   mpaCompressionMethod, useParallelTableGeneration] = arm.getSettings().fractal.mpa;
+                   mpaCompressionMethod, useParallelTableGeneration, useMergedTableGeneration] =
+                    arm.getSettings().fractal.mpa;
             auto window = std::make_unique<SettingsWindow>(L"MP-Approximation");
             window->registerTextInput<uint16_t>(
                     L"Min Skip Reference", &minSkipReference, Unparser::UINT16, Parser::UINT16,
@@ -202,6 +203,14 @@ namespace merutilm::rff2 {
                                           L"Sets whether the MPA table creation should be parallel.\n"
                                           L"Each skipping level is computed by its own thread,\n"
                                           L"so the result is identical to the sequential creation.");
+
+            window->registerCheckboxInput(L"Merged table generation", &useMergedTableGeneration,
+                                          Callback::NOTHING, L"Use merged table generation",
+                                          L"Composes every upper-level PA from its sub-level PAs instead of\n"
+                                          L"stepping the orbit on all levels, so the table creation cost is about\n"
+                                          L"the longest period instead of levels x longest period.\n"
+                                          L"It uses the same composition as the reference-compression jump,\n"
+                                          L"and takes priority over the parallel creation when applicable.");
 
             window->setWindowCloseFunction([&arm] { arm.setCurrentSettingsWindows(nullptr); });
             arm.setCurrentSettingsWindows(std::move(window));

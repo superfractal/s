@@ -18,5 +18,6 @@ namespace merutilm::rff2 {
         FrtMPASelectionMethod mpaSelectionMethod;
         FrtMPACompressionMethod mpaCompressionMethod;
         bool useParallelTableGeneration;
+        bool useMergedTableGeneration;
     };
 }

@@ -113,6 +113,35 @@ target_link_libraries(RFF PRIVATE
 )
 
 
+# Added by Fable 5 : benchmark of the MPA table creation strategies
+add_executable(
+        RFF_MPABench
+        src/rff2/bench/MPATableBench.cpp
+        src/rff2/mrthy/MPAPeriod.cpp
+        src/rff2/parallel/ParallelRenderState.cpp
+)
+
+set_target_properties(RFF_MPABench PROPERTIES CXX_SCAN_FOR_MODULES OFF)
+
+target_compile_options(RFF_MPABench PRIVATE
+        $<$<CONFIG:Debug>:-O0>
+        $<$<CONFIG:Release>:-O3 -ffast-math -fno-associative-math -funroll-loops -march=native -mllvm -inline-threshold=4000>
+)
+
+find_package(Vulkan REQUIRED)
+
+target_include_directories(RFF_MPABench PRIVATE
+        ${CMAKE_SOURCE_DIR}/extern
+        ${CMAKE_SOURCE_DIR}/include
+        ${CLANG64_DIRS}/include
+        ${Vulkan_INCLUDE_DIRS}
+)
+
+target_link_libraries(RFF_MPABench PRIVATE
+        ${CLANG64_LIBS}/libgmp.a
+)
+
+
 macro(RFF_DEFINITION def str flag)
     option(${def} ${str} ${flag})
     if(${def})
