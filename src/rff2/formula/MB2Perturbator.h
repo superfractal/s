@@ -1,5 +1,6 @@
 //
 // Created by Merutilm on 2025-05-18.
+// Modified by Fable 5
 //
 
 #pragma once
@@ -111,20 +112,19 @@ namespace merutilm::rff2 {
                 return isAbs ? 1 : static_cast<double>(maxIteration);
             }
 
+            auto mpaLookuper = typename MPATable<Num>::Lookuper(table);
 
             while (iteration < maxIteration) {
-                if (table != nullptr) {
-                    if (PA<Num> *paPtr = table->lookup(refIteration, dz); paPtr != nullptr) {
-                        PA<Num> &pa = *paPtr;
+                if (PA<Num> *paPtr = mpaLookuper.lookup(refIteration, dz); paPtr != nullptr) {
+                    PA<Num> &pa = *paPtr;
 
-                        dz = pa.apply(dz, dc0);
-                        iteration += pa.skip;
-                        refIteration += pa.skip;
-                        ++absIteration;
+                    dz = pa.apply(dz, dc0);
+                    iteration += pa.skip;
+                    refIteration += pa.skip;
+                    ++absIteration;
 
-                        if (iteration >= maxIteration) {
-                            return static_cast<double>(isAbs ? absIteration : maxIteration);
-                        }
+                    if (iteration >= maxIteration) {
+                        return static_cast<double>(isAbs ? absIteration : maxIteration);
                     }
                 }
 

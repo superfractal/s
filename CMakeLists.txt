@@ -9,6 +9,19 @@ endif()
 set(CLANG64_DIRS "$ENV{MSYS2_ROOT}/clang64")
 set(CLANG64_LIBS "${CLANG64_DIRS}/lib")
 
+# Modified by Fable 5 : prefer the CPU-tuned local GMP build when present.
+# The MSYS2 fat-build libgmp.a does not recognize Zen 5 and dispatches the
+# mul/sqr basecase to the slow generic C fallback (see extern/gmp-zen1/README.txt).
+if(EXISTS "${CMAKE_SOURCE_DIR}/extern/gmp-zen1/lib/libgmp.a")
+    set(RFF_GMP_LIB "${CMAKE_SOURCE_DIR}/extern/gmp-zen1/lib/libgmp.a")
+    set(RFF_GMP_INCLUDE "${CMAKE_SOURCE_DIR}/extern/gmp-zen1/include")
+    message(STATUS "GMP: using CPU-tuned build ${RFF_GMP_LIB}")
+else()
+    set(RFF_GMP_LIB "${CLANG64_LIBS}/libgmp.a")
+    set(RFF_GMP_INCLUDE "${CLANG64_DIRS}/include")
+    message(STATUS "GMP: using MSYS2 build ${RFF_GMP_LIB}")
+endif()
+
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
@@ -87,6 +100,8 @@ add_subdirectory(src/vulkan_helper)
 
 
 target_include_directories(RFF PRIVATE
+        # GMP include dir (must precede clang64 include so the tuned build's gmp.h wins)
+        ${RFF_GMP_INCLUDE}
         # extern sources
         ${CMAKE_SOURCE_DIR}/extern
         # clang include dirs
@@ -99,7 +114,7 @@ target_include_directories(RFF PRIVATE
 
 target_link_libraries(RFF PRIVATE
         # GMP Linker
-        ${CLANG64_LIBS}/libgmp.a
+        ${RFF_GMP_LIB}
         # Win32 Linker
         comctl32
         # OpenCV Linkers
@@ -131,6 +146,7 @@ target_compile_options(RFF_MPABench PRIVATE
 find_package(Vulkan REQUIRED)
 
 target_include_directories(RFF_MPABench PRIVATE
+        ${RFF_GMP_INCLUDE}
         ${CMAKE_SOURCE_DIR}/extern
         ${CMAKE_SOURCE_DIR}/include
         ${CLANG64_DIRS}/include
@@ -138,7 +154,7 @@ target_include_directories(RFF_MPABench PRIVATE
 )
 
 target_link_libraries(RFF_MPABench PRIVATE
-        ${CLANG64_LIBS}/libgmp.a
+        ${RFF_GMP_LIB}
 )
 
 

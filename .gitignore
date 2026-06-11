@@ -42,6 +42,8 @@ bin
 /backup/
 /bin/
 /build/
+# machine-specific CPU-tuned GMP build (see extern/gmp-zen1/README.txt)
+/extern/gmp-zen1/
 /.claude/
 /docs/
 /include/

@@ -157,6 +157,152 @@ namespace merutilm::rff2 {
     public:
         [[nodiscard]] PA<Num> *lookup(uint64_t refIteration, complex<Num> dz) const;
         [[nodiscard]] size_t getLength();
+
+        [[nodiscard]] static PA<Num> *selectPA(std::pmr::vector<PA<Num>> &entry, Num r,
+                                               FrtMPASelectionMethod method);
+
+        /**
+         * Incremental replacement of lookup() for the monotonically walking refIteration of the
+         * pixel loop. Table entries only exist at the "pulled" positions of the period structure,
+         * so the next pulled position is tracked through the block-digit cascade instead of
+         * running the integer divisions of iterationToPulledTableIndex() on every query.
+         * Queries between pulled positions return nullptr with a single comparison; backward
+         * jumps (rebase) and forward jumps (PA skip) trigger a re-seek. The returned PA is
+         * identical to lookup() for any query sequence.
+         */
+        struct Lookuper {
+            static constexpr uint64_t NONE = UINT64_MAX;
+
+            const MPATable *table;
+            size_t levels = 0;
+            uint64_t p0req1 = 0; // tablePeriod[0] - REQUIRED_PERTURBATION + 1
+            uint64_t longestPeriod = 0;
+            uint64_t lastQuery = 0;
+            uint64_t nextPulled = NONE; // next iteration with a possible table entry
+            uint64_t nextOrdinal = 0;   // its pulled table index
+            std::vector<uint64_t> digits; // block counts per level of nextPulled
+
+            explicit Lookuper(const MPATable *const table) : table(table) {
+                if (table != nullptr && table->mpaPeriod != nullptr && table->tableManager.has_value()) {
+                    const auto &tablePeriod = table->mpaPeriod->tablePeriod;
+                    levels = tablePeriod.size();
+                    p0req1 = tablePeriod[0] - REQUIRED_PERTURBATION + 1;
+                    longestPeriod = tablePeriod.back();
+                    digits.assign(levels, 0);
+                    reseek(1);
+                }
+            }
+
+            [[nodiscard]] PA<Num> *lookup(const uint64_t refIteration, const complex<Num> &dz) {
+                if (levels == 0) {
+                    return nullptr;
+                }
+                if (refIteration < lastQuery) {
+                    reseek(refIteration);
+                }
+                lastQuery = refIteration;
+                if (refIteration != nextPulled) {
+                    if (nextPulled == NONE || refIteration < nextPulled) {
+                        return nullptr;
+                    }
+                    reseek(refIteration);
+                    if (refIteration != nextPulled) {
+                        return nullptr;
+                    }
+                }
+
+                uint64_t index;
+                switch (table->mpaSettings.mpaCompressionMethod) {
+                    using enum FrtMPACompressionMethod;
+                    case NO_COMPRESSION:
+                        index = refIteration;
+                        break;
+                    case LITTLE_COMPRESSION:
+                        index = nextOrdinal;
+                        break;
+                    case STRONGEST:
+                        index = ArrayCompressor::compress(table->pulledMPACompressor, nextOrdinal);
+                        break;
+                    default:
+                        index = NONE;
+                        break;
+                }
+
+                PA<Num> *result = nullptr;
+                if (const auto &mpaTable = *table->tableManager->mpaTable; index < mpaTable.size()) {
+                    if (std::pmr::vector<PA<Num>> &entry = mpaTable[index]; !entry.empty()) {
+                        result = selectPA(entry, dz.norm_approx(), table->mpaSettings.mpaSelectionMethod);
+                    }
+                }
+                advance();
+                return result;
+            }
+
+        private:
+            // The pulled iterations are I = 1 + sum(digits[i] * tablePeriod[i]) whose offset within
+            // every enclosing block leaves room for at least one level-0 skip, mirroring the greedy
+            // decomposition of iterationToPulledTableIndex() :
+            //   for every level i in [1, levels) with digits[i-1] > 0 :
+            //     sum_{j<i}(digits[j] * tablePeriod[j]) + 1 + p0req1 <= tablePeriod[i]
+
+            void advance() {
+                if (nextPulled == NONE) {
+                    return;
+                }
+                ++digits[0];
+                finalize();
+            }
+
+            void reseek(uint64_t target) {
+                const auto &tablePeriod = table->mpaPeriod->tablePeriod;
+                target = std::max<uint64_t>(target, 1);
+                if (target > longestPeriod) {
+                    nextPulled = NONE;
+                    return;
+                }
+                uint64_t remainder = target - 1;
+                for (size_t i = levels; i > 0; --i) {
+                    digits[i - 1] = remainder / tablePeriod[i - 1];
+                    remainder %= tablePeriod[i - 1];
+                }
+                finalize();
+                // the greedy floor candidate may sit slightly below the target. the gap between
+                // pulled positions is at least p0req1, so only a few successor steps are needed.
+                while (nextPulled != NONE && nextPulled < target) {
+                    ++digits[0];
+                    finalize();
+                }
+            }
+
+            // resolves the constraint violations upwards by carrying, then refreshes
+            // nextPulled / nextOrdinal. carrying beyond the longest period yields NONE.
+            void finalize() {
+                const auto &tablePeriod = table->mpaPeriod->tablePeriod;
+                uint64_t lower = digits[0] * tablePeriod[0];
+                for (size_t i = 1; i < levels; ++i) {
+                    if (digits[i - 1] > 0 && lower + 1 + p0req1 > tablePeriod[i]) {
+                        // the offset cannot host another sub-block before the periodic point : carry
+                        for (size_t j = 0; j < i; ++j) {
+                            digits[j] = 0;
+                        }
+                        ++digits[i];
+                        lower = 0;
+                    }
+                    lower += digits[i] * tablePeriod[i];
+                }
+                if (lower + 1 > longestPeriod) {
+                    nextPulled = NONE;
+                    return;
+                }
+                nextPulled = lower + 1;
+                const auto &skippableIterationsCount = table->mpaPeriod->skippableIterationsCount;
+                uint64_t ordinal = 0;
+                for (size_t i = 0; i < levels; ++i) {
+                    ordinal += digits[i] * skippableIterationsCount[i];
+                }
+                nextOrdinal = ordinal;
+            }
+        };
     };
 
     // DEFINITION OF MPA TABLE
@@ -1155,14 +1301,18 @@ namespace merutilm::rff2 {
             return nullptr;
         }
 
-        const Num r = dz.norm_approx();
+        return selectPA(table, dz.norm_approx(), mpaSettings.mpaSelectionMethod);
+    }
 
-        switch (mpaSettings.mpaSelectionMethod) {
+    template<Number Num>
+    PA<Num> *MPATable<Num>::selectPA(std::pmr::vector<PA<Num>> &entry, const Num r,
+                                     const FrtMPASelectionMethod method) {
+        switch (method) {
             using enum FrtMPASelectionMethod;
             case LOWEST: {
                 PA<Num> *pa = nullptr;
 
-                for (PA<Num> &test: table) {
+                for (PA<Num> &test: entry) {
                     if (test.isValid(r)) {
                         pa = &test;
                     } else return pa;
@@ -1170,15 +1320,15 @@ namespace merutilm::rff2 {
                 return pa;
             }
             case HIGHEST: {
-                PA<Num> &pa = table.front();
+                PA<Num> &pa = entry.front();
                 //This table cannot be empty because the pre-processing is done.
 
                 if (!pa.isValid(r)) {
                     return nullptr;
                 }
 
-                for (uint64_t j = table.size(); j > 0; --j) {
-                    PA<Num> &test = table[j - 1];
+                for (uint64_t j = entry.size(); j > 0; --j) {
+                    PA<Num> &test = entry[j - 1];
                     if (test.isValid(r)) {
                         return &test;
                     }
