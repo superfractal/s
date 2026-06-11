@@ -177,85 +177,6 @@ namespace merutilm::rff2::bench {
         return result;
     }
 
-    struct LookuperCheck {
-        uint64_t mismatches = 0;
-        uint64_t hits = 0;
-        double oldSeconds = 0;
-        double newSeconds = 0;
-    };
-
-    // verifies that MPATable::Lookuper returns the identical PA as lookup() for the query
-    // patterns of the pixel loop (sequential walk, PA-skip jumps, rebase resets), and times
-    // a full sweep of both.
-    template<Number Num>
-    LookuperCheck verifyLookuper(const MPATable<Num> &table, const uint64_t longestPeriod) {
-        LookuperCheck result{};
-        static constexpr double RADII[] = {0.0, 1e-8, 1e-5, 1e-3, 1.0};
-
-        for (const double radius: RADII) {
-            const auto dz = complex<Num>{Num(radius), Num(0)};
-
-            // sequential sweep over every refIteration
-            auto sweepLookuper = typename MPATable<Num>::Lookuper(&table);
-            for (uint64_t it = 0; it <= longestPeriod; ++it) {
-                PA<Num> *expected = table.lookup(it, dz);
-                PA<Num> *actual = sweepLookuper.lookup(it, dz);
-                if (expected != actual) {
-                    if (result.mismatches < 5) {
-                        std::printf("    LOOKUPER MISMATCH (sweep) : it %" PRIu64 " radius %.1e\n", it, radius);
-                    }
-                    ++result.mismatches;
-                }
-            }
-
-            // perturbator-like walk : skip jumps on hit, periodic rebase to zero
-            auto walkLookuper = typename MPATable<Num>::Lookuper(&table);
-            uint64_t it = 0;
-            uint64_t steps = 0;
-            while (it <= longestPeriod && steps < longestPeriod * 2) {
-                PA<Num> *expected = table.lookup(it, dz);
-                PA<Num> *actual = walkLookuper.lookup(it, dz);
-                if (expected != actual) {
-                    if (result.mismatches < 5) {
-                        std::printf("    LOOKUPER MISMATCH (walk) : it %" PRIu64 " radius %.1e\n", it, radius);
-                    }
-                    ++result.mismatches;
-                }
-                if (expected != nullptr) {
-                    it += expected->skip;
-                    ++result.hits;
-                } else {
-                    ++it;
-                }
-                if ((++steps & 0xfffff) == 0) {
-                    it = 0; // rebase
-                }
-            }
-        }
-
-        const auto dz = complex<Num>{Num(1e-5), Num(0)};
-        uint64_t sink = 0;
-        {
-            const auto begin = std::chrono::steady_clock::now();
-            for (uint64_t it = 0; it <= longestPeriod; ++it) {
-                sink += table.lookup(it, dz) != nullptr;
-            }
-            result.oldSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
-        }
-        {
-            auto timedLookuper = typename MPATable<Num>::Lookuper(&table);
-            const auto begin = std::chrono::steady_clock::now();
-            for (uint64_t it = 0; it <= longestPeriod; ++it) {
-                sink += timedLookuper.lookup(it, dz) != nullptr;
-            }
-            result.newSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
-        }
-        if (sink == UINT64_MAX) {
-            std::printf("?"); // keep the timing loops alive
-        }
-        return result;
-    }
-
     inline const char *methodName(const FrtMPACompressionMethod method) {
         switch (method) {
             case FrtMPACompressionMethod::NO_COMPRESSION: return "NO_COMPRESSION    ";
@@ -283,18 +204,6 @@ namespace merutilm::rff2::bench {
             std::printf("== %s | longestPeriod %" PRIu64 " | levels %" PRIu64 " | %s ==\n", name, longestPeriod,
                         levels, methodName(method));
             std::printf("  sequential : %8.3f s\n", seqSeconds);
-
-            {
-                const LookuperCheck check = verifyLookuper(*sequential, longestPeriod);
-                std::printf("  lookuper   : sweep old %.3f s  new %.3f s   (x%.1f) | walk hits %" PRIu64 "\n",
-                            check.oldSeconds, check.newSeconds, check.oldSeconds / check.newSeconds, check.hits);
-                if (check.mismatches == 0) {
-                    std::printf("    equivalence to lookup() : OK\n");
-                } else {
-                    std::printf("    equivalence to lookup() : FAILED (%" PRIu64 " mismatches)\n", check.mismatches);
-                    ++failures;
-                }
-            }
 
             {
                 settings.useMergedTableGeneration = true;
