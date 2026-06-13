@@ -1,8 +1,10 @@
 //
 // Created by Merutilm on 2025-05-18.
+// Modified by Opus 4.8
 //
 
 #pragma once
+#include <chrono>
 #include <vector>
 
 #include "../calc/calculatable.hpp"
@@ -13,6 +15,7 @@
 #include "../settings/FrtGeneralSettings.hpp"
 #include "../settings/FrtReferenceSettings.hpp"
 #include "Reference.hpp"
+#include "vulkan_helper/base/logger.hpp"
 
 namespace merutilm::rff2 {
 
@@ -161,6 +164,10 @@ namespace merutilm::rff2 {
 
         uint64_t period = 0;
 
+        // real-time compression status logging
+        uint64_t maxCompressedLength = 0;
+        auto lastLogTime = std::chrono::steady_clock::now();
+
         for (period = 0; period == 0 || z0.norm_sqr() < bailoutSqr; ++period) {
             if (state.interruptRequested()) {
                 return CreationResult::TERMINATED;
@@ -256,6 +263,21 @@ namespace merutilm::rff2 {
                     ref.push_back(z0);
                 } else {
                     ref[index] = z0;
+                }
+            }
+
+            // LOG REAL-TIME COMPRESSION STATUS (Time-based to avoid spam and work everywhere)
+            const uint64_t compressedLength = period - compressed;
+            if (compressedLength > maxCompressedLength) {
+                maxCompressedLength = compressedLength;
+            }
+            if (period > 0 && period % 2000 == 0) {
+                auto now = std::chrono::steady_clock::now();
+                if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastLogTime).count() > 500) {
+                    vkh::logger::log("Calculating Period: {} / Compressed Length: {} ({:.2f}%) / Max: {}",
+                                     period, compressedLength,
+                                     static_cast<double>(compressedLength) / period * 100.0, maxCompressedLength);
+                    lastLogTime = now;
                 }
             }
         }
